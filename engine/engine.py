@@ -15,17 +15,25 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import rotate_half
 
+try:
+    from kernels.norms import rms_norm as fused_rms_norm
+    from kernels.norms import self_check as fused_norm_self_check
+except Exception:
+    fused_rms_norm = None
+    fused_norm_self_check = None
+
 
 class DecodeRunner:
     """Single-token decode step for a fixed batch size and cache capacity."""
 
-    def __init__(self, model, batch: int, capacity: int, use_graph: bool) -> None:
+    def __init__(self, model, batch: int, capacity: int, use_graph: bool, fused_norm: bool = False) -> None:
         cfg = model.config
         base = model.model
         weight = base.embed_tokens.weight
         device, dtype = weight.device, weight.dtype
 
         self.model = model
+        self.fused_norm = fused_norm
         self.batch = batch
         self.capacity = capacity
         self.n_heads = cfg.num_attention_heads
@@ -68,6 +76,11 @@ class DecodeRunner:
             with torch.cuda.graph(self.graph):
                 self._step()
 
+    def _norm(self, x: torch.Tensor, module) -> torch.Tensor:
+        if self.fused_norm:
+            return fused_rms_norm(x, module.weight, module.variance_epsilon)
+        return module(x)
+
     def _step(self) -> None:
         """Consume self.tok at position self.pos; write the next token to self.tok."""
         model = self.model
@@ -83,10 +96,10 @@ class DecodeRunner:
 
         for i, layer in enumerate(base.layers):
             attn = layer.self_attn
-            h = layer.input_layernorm(x)
+            h = self._norm(x, layer.input_layernorm)
             qkv = F.linear(h, self.qkv_weight[i])
-            q = attn.q_norm(qkv[:, : self.q_dim].view(B, self.n_heads, hd))
-            k = attn.k_norm(qkv[:, self.q_dim : self.q_dim + self.kv_dim].view(B, self.n_kv, hd))
+            q = self._norm(qkv[:, : self.q_dim].view(B, self.n_heads, hd), attn.q_norm)
+            k = self._norm(qkv[:, self.q_dim : self.q_dim + self.kv_dim].view(B, self.n_kv, hd), attn.k_norm)
             v = qkv[:, self.q_dim + self.kv_dim :].view(B, self.n_kv, 1, hd)
             q = q * cos + rotate_half(q) * sin
             k = k * cos + rotate_half(k) * sin
@@ -105,10 +118,10 @@ class DecodeRunner:
             )
             x = x + attn.o_proj(o.reshape(B, self.n_heads * hd))
             mlp = layer.mlp
-            gate_up = F.linear(layer.post_attention_layernorm(x), self.gate_up_weight[i])
+            gate_up = F.linear(self._norm(x, layer.post_attention_layernorm), self.gate_up_weight[i])
             x = x + mlp.down_proj(mlp.act_fn(gate_up[:, : self.inter]) * gate_up[:, self.inter :])
 
-        logits = model.lm_head(base.norm(x))
+        logits = model.lm_head(self._norm(x, base.norm))
         self.tok.copy_(logits.argmax(dim=-1))
         self.pos.add_(1)
 
@@ -154,9 +167,24 @@ class Engine:
             self._runner = None
             self._runner_key = None
             torch.cuda.empty_cache()
-            self._runner = DecodeRunner(self.model, batch, capacity, use_graph=True)
+            self._runner = self._build_runner(batch, capacity)
             self._runner_key = key
         return self._runner
+
+    def _build_runner(self, batch: int, capacity: int) -> DecodeRunner:
+        if fused_rms_norm is not None:
+            try:
+                if not fused_norm_self_check(torch.device("cuda:0")):
+                    raise RuntimeError("fused rms_norm disagrees with the reference")
+                return DecodeRunner(self.model, batch, capacity, use_graph=True, fused_norm=True)
+            except Exception:
+                print(
+                    "[engine] fused norm unavailable, using reference norms:\n" + traceback.format_exc(),
+                    file=sys.stderr,
+                    flush=True,
+                )
+                torch.cuda.empty_cache()
+        return DecodeRunner(self.model, batch, capacity, use_graph=True)
 
     def generate(self, input_ids: list[list[int]], max_new_tokens: int):
         """Greedy continuation of every sequence, one step at a time.
