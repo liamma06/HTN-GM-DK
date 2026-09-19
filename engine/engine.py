@@ -43,6 +43,18 @@ class DecodeRunner:
         self.pos_ids = self.pos.view(1, 1)
         self.arange = torch.arange(capacity, dtype=torch.int64, device=device)
 
+        # One matmul for q/k/v and one for gate/up per layer, built once here.
+        self.qkv_weight = [
+            torch.cat([l.self_attn.q_proj.weight, l.self_attn.k_proj.weight, l.self_attn.v_proj.weight], dim=0)
+            for l in base.layers
+        ]
+        self.gate_up_weight = [
+            torch.cat([l.mlp.gate_proj.weight, l.mlp.up_proj.weight], dim=0) for l in base.layers
+        ]
+        self.q_dim = self.n_heads * self.head_dim
+        self.kv_dim = self.n_kv * self.head_dim
+        self.inter = cfg.intermediate_size
+
         self.graph = None
         if use_graph:
             side = torch.cuda.Stream()
@@ -72,9 +84,10 @@ class DecodeRunner:
         for i, layer in enumerate(base.layers):
             attn = layer.self_attn
             h = layer.input_layernorm(x)
-            q = attn.q_norm(attn.q_proj(h).view(B, self.n_heads, hd))
-            k = attn.k_norm(attn.k_proj(h).view(B, self.n_kv, hd))
-            v = attn.v_proj(h).view(B, self.n_kv, 1, hd)
+            qkv = F.linear(h, self.qkv_weight[i])
+            q = attn.q_norm(qkv[:, : self.q_dim].view(B, self.n_heads, hd))
+            k = attn.k_norm(qkv[:, self.q_dim : self.q_dim + self.kv_dim].view(B, self.n_kv, hd))
+            v = qkv[:, self.q_dim + self.kv_dim :].view(B, self.n_kv, 1, hd)
             q = q * cos + rotate_half(q) * sin
             k = k * cos + rotate_half(k) * sin
 
@@ -91,7 +104,9 @@ class DecodeRunner:
                 scale=self.scale,
             )
             x = x + attn.o_proj(o.reshape(B, self.n_heads * hd))
-            x = x + layer.mlp(layer.post_attention_layernorm(x))
+            mlp = layer.mlp
+            gate_up = F.linear(layer.post_attention_layernorm(x), self.gate_up_weight[i])
+            x = x + mlp.down_proj(mlp.act_fn(gate_up[:, : self.inter]) * gate_up[:, self.inter :])
 
         logits = model.lm_head(base.norm(x))
         self.tok.copy_(logits.argmax(dim=-1))
